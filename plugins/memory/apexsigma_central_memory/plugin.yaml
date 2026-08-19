@@ -1,0 +1,3 @@
+name: apexsigma_central_memory
+version: 0.1.0
+description: "Fail-closed Gateway-mediated central memory provider surface."
