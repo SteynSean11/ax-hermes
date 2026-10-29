@@ -1,0 +1,137 @@
+name: Security
+
+# Security baseline for ax-hermes (a fork of NousResearch/hermes-agent).
+#
+# Ported from the shared ApexSigma CI baseline (ax-trax / ax-gateway /
+# ax-omega / ax-eco-context) as part of RUNBOOK-INFRA-700-001 gate GC,
+# finding C4.
+#
+# WHAT IS HERE AND WHY
+# ---------------------
+# This fork already ships upstream's own OSV scan
+# (.github/workflows/osv-scanner.yml, surfaced by the upstream `CI`
+# orchestrator as the `OSV scan` job). It is deliberately NOT duplicated
+# here: two OSV jobs over the same uv.lock would be redundant, and the
+# upstream one is `fail-on-vuln: false` with a SARIF upload, which is the
+# upstream contract.
+#
+# What upstream does NOT have is a committed-secret scan. That is the gap
+# this file closes:
+#
+#   - Gitleaks: the fork ships agent code that reads provider credentials
+#     from the environment, so a committed-secret scan on every PR is the
+#     minimum bar.
+#   - Semgrep: the free `p/security-audit` ruleset, the local/CI substitute
+#     for CodeQL when GitHub Advanced Security is unavailable.
+#
+# The MAR gate requires a workflow named `Security` to be green
+# (MAR_REQUIRED_WORKFLOWS defaults to `CI,Security`). The upstream `CI`
+# orchestrator covers the OSV side; this workflow covers the secret-scan
+# and static-analysis side.
+#
+# Upstream-only jobs (CodeQL, dependency review) are not ported: both need
+# GitHub Advanced Security, which is not provisioned on this fork. See
+# .github/workflows/README-fork-notes.md.
+
+on:
+  pull_request:
+    branches: [beta, main]
+  push:
+    branches: [beta, main]
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gitleaks:
+    name: Gitleaks current-tree scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 1
+
+      - name: Install Gitleaks with checksum verification
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "${base}/${archive}" -o "/tmp/${archive}"
+          curl -sSfL "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o /tmp/gitleaks_checksums.txt
+          grep "${archive}" /tmp/gitleaks_checksums.txt > /tmp/gitleaks_linux_x64.sha256
+          (cd /tmp && sha256sum -c /tmp/gitleaks_linux_x64.sha256)
+          tar -xzf "/tmp/${archive}" -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan current tracked tree for committed secrets
+        # -c .gitleaks.toml loads the fork's allowlist, which grandfathers
+        # the 781 PRE-EXISTING upstream findings (none of them a live
+        # credential; each entry in that file carries a written reason).
+        # Verified locally against gitleaks 8.30.1: a clean tree reports
+        # "no leaks found" (exit 0), and a newly added secret still fails
+        # the gate.
+        run: gitleaks dir . --redact --no-banner --exit-code 1 -c .gitleaks.toml
+
+  semgrep:
+    name: Semgrep static analysis
+    # The local/CI substitute for CodeQL when GHAS is unavailable, which is
+    # true for this fork. Uses the free `p/security-audit` registry ruleset
+    # with --metrics=off, not the `auto` config (which refuses to run with
+    # metrics off) and not the token-gated Semgrep CI/AppSec Platform
+    # integration. Image digest verified live against Docker Hub's registry
+    # API for the semgrep/semgrep:1.177.0 tag on 2026-09-19 — re-verify
+    # before bumping, this is not a floating tag.
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.177.0@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # The baseline comparison below needs the target branch's history,
+          # not just the PR head.
+          fetch-depth: 0
+
+      - name: Run Semgrep
+        # Two deliberate differences from the shared baseline:
+        #
+        # 1. Scan root `.` instead of `src`. The shared baseline scans a
+        #    `src/` layout; this fork is a flat package (Python sources at
+        #    the repository root plus `agent/`, `hermes_cli/`, `plugins/`).
+        #    `src` does not exist here, and `semgrep --error src` aborts with
+        #    "Invalid scanning root: src".
+        #
+        # 2. `--baseline-commit` against the integration branch. The
+        #    upstream tree carries pre-existing findings under
+        #    `p/security-audit` (WARNING-severity audit rules such as
+        #    `dynamic-urllib-use-detected` and `insecure-hash-algorithm-sha1`,
+        #    plus a few ERROR rules). This is inherited upstream code, not a
+        #    regression from this port, and a C4 baseline must not land red.
+        #    `--baseline-commit` reports only findings that are NOT already
+        #    present on the baseline commit, so existing debt is
+        #    grandfathered and any NEW issue still fails the build.
+        #    `--severity ERROR` drops the WARNING-severity audit rules,
+        #    which are advisory ("audit uses of urllib calls to ensure...")
+        #    rather than defects.
+        #
+        # Verified locally on this tree: baseline scan -> 0 findings;
+        # a newly added file with a real `shell=True` call -> 1 blocking
+        # finding.
+        env:
+          BASELINE_REF: origin/${{ vars.MAR_BASE_BRANCH || 'beta' }}
+        run: >-
+          semgrep scan --config p/security-audit --metrics=off
+          --severity ERROR --baseline-commit "${BASELINE_REF}" --error .
+          --exclude=tests --exclude=benchmarks --exclude=node_modules
+          --exclude=.git --exclude=uv.lock

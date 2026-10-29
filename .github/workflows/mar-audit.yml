@@ -1,0 +1,161 @@
+name: MAR audit
+
+# Post-merge MAR audit, eco-context SPEC-MAR-003 §12 option D.
+# Runs on every push to the MAR base branch. Each merged PR in the push must
+# have `MAR` = success on its head SHA (a PASS or a SPEC-MAR-002 override).
+# Otherwise, and for a push with no merged PR (a direct push), it opens one
+# `mar-breach` issue per finding, so SPEC-MAR-001 "Consequences Of Breach"
+# (reopen the task, inspect the gap, restore evidence) has a tracked owner.
+# It does not block or revert anything. See docs/ci-cd.md "MAR review".
+#
+# Trust model: this file and scripts/mar_gate.py always run from the base
+# branch's own commit (`github.sha`): the pushed commit for `push`, the branch
+# tip for a manual run, which is only accepted on the base branch. The
+# optional `sha` input is data only: it must be a 7-40 character hex SHA that
+# is already in the base branch's history, and it is never checked out or
+# executed. No PR code runs here.
+
+on:
+  push:
+    branches: [beta]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Base-branch commit to re-audit (default: branch head)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mar-audit-${{ github.event.after || inputs.sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: MAR post-merge audit
+    # A manual run from any other branch would execute that branch's copy of
+    # this file and of mar_gate.py; only audit from the base branch.
+    if: github.ref == 'refs/heads/beta'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read # commits/{sha}/pulls
+      statuses: read # MAR status on each merged head
+      issues: write # open mar-breach issues
+    steps:
+      - name: Check out the base-branch commit (trusted, already merged)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Collect merged PRs and their MAR status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          INPUT_SHA: ${{ inputs.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT}" == "push" ]]; then
+            after="$(jq -r '.after' "${GITHUB_EVENT_PATH}")"
+            mapfile -t shas < <(jq -r '.commits[].id' "${GITHUB_EVENT_PATH}")
+          else
+            after="${INPUT_SHA:-${HEAD_SHA}}"
+            if [[ ! "${after}" =~ ^[0-9a-f]{7,40}$ ]]; then
+              echo "::error title=MAR audit::sha must be a 7-40 character hex commit SHA"
+              exit 1
+            fi
+            # Only commits already in the base branch can be re-audited.
+            relation="$(gh api "repos/${REPO}/compare/${after}...${BASE}" --jq .status)"
+            if [[ "${relation}" != "ahead" && "${relation}" != "identical" ]]; then
+              echo "::error title=MAR audit::${after} is not in ${BASE} history (compare: ${relation})"
+              exit 1
+            fi
+            shas=("${after}")
+          fi
+          commits='[]'
+          for sha in "${shas[@]}"; do
+            # The commit -> PR association can lag a merge by a few seconds.
+            pulls='[]'
+            for attempt in 1 2 3; do
+              pulls="$(gh api "repos/${REPO}/commits/${sha}/pulls")"
+              if [[ "$(jq length <<<"${pulls}")" -gt 0 ]]; then break; fi
+              if [[ "${attempt}" -lt 3 ]]; then sleep 10; fi
+            done
+            commits="$(jq -c --arg sha "${sha}" --argjson pulls "${pulls}" \
+              '. + [{sha: $sha, pulls: $pulls}]' <<<"${commits}")"
+          done
+          statuses='{}'
+          mapfile -t heads < <(jq -r --arg base "${BASE}" \
+            '[.[].pulls[] | select(.merged_at != null and .base.ref == $base) | .head.sha] | unique | .[]' \
+            <<<"${commits}")
+          for head in "${heads[@]}"; do
+            status="$(gh api "repos/${REPO}/commits/${head}/status?per_page=100")"
+            statuses="$(jq -c --arg h "${head}" --argjson s "${status}" \
+              '. + {($h): $s}' <<<"${statuses}")"
+          done
+          jq -n --arg repo "${REPO}" --arg base "${BASE}" --arg after "${after}" \
+            --argjson commits "${commits}" --argjson statuses "${statuses}" \
+            '{repo: $repo, base: $base, after: $after, commits: $commits, statuses: $statuses}' \
+            > "${RUNNER_TEMP}/audit-payload.json"
+
+      - name: Evaluate
+        id: audit
+        run: |
+          set -euo pipefail
+          python3 scripts/mar_gate.py --github-output "${GITHUB_OUTPUT}" audit \
+            --payload-file "${RUNNER_TEMP}/audit-payload.json" \
+            --findings "${RUNNER_TEMP}/findings.json"
+
+      - name: Open mar-breach issues
+        if: steps.audit.outputs.breach == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ steps.audit.outputs.label }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "${LABEL}" --repo "${REPO}" --color B60205 \
+            --description "Merged without a MAR PASS (SPEC-MAR-003 option D)" 2>/dev/null || true
+          existing="$(gh issue list --repo "${REPO}" --label "${LABEL}" --state all \
+            --limit 500 --json title --jq '.[].title')"
+          count="$(jq length "${RUNNER_TEMP}/findings.json")"
+          for ((i = 0; i < count; i++)); do
+            title="$(jq -r ".[${i}].title" "${RUNNER_TEMP}/findings.json")"
+            if grep -Fxq -- "${title}" <<<"${existing}"; then
+              echo "Already tracked: ${title}"
+              continue
+            fi
+            {
+              jq -r ".[${i}].body" "${RUNNER_TEMP}/findings.json"
+              printf '\nDetected by %s\n' "${RUN_URL}"
+            } > "${RUNNER_TEMP}/issue-body.md"
+            gh issue create --repo "${REPO}" --title "${title}" --label "${LABEL}" \
+              --body-file "${RUNNER_TEMP}/issue-body.md"
+            echo "::warning title=MAR breach::${title}"
+          done
+
+      - name: Summary
+        if: always()
+        env:
+          BREACH: ${{ steps.audit.outputs.breach }}
+          COUNT: ${{ steps.audit.outputs.count }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## MAR post-merge audit"
+            if [[ "${BREACH}" == "true" ]]; then
+              echo "**${COUNT} breach finding(s).** See issues labelled \`mar-breach\`."
+              jq -r '.[] | "- " + .title' "${RUNNER_TEMP}/findings.json"
+            elif [[ "${BREACH}" == "false" ]]; then
+              echo "Clean: every merged PR in this push has MAR = success."
+            else
+              echo "Audit did not complete; see the job log."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "track_id", "summary", "criteria", "rejection_reasons", "known_gaps"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["PASS", "REJECT"]},
+    "track_id": {"type": "string"},
+    "summary": {"type": "string"},
+    "criteria": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategic_alignment", "technical_accuracy", "scope_discipline", "forensic_integrity"],
+      "properties": {
+        "strategic_alignment": {"type": "object", "required": ["result", "notes"], "properties": {"result": {"type": "string", "enum": ["PASS", "REJECT"]}, "notes": {"type": "string"}}},
+        "technical_accuracy": {"type": "object", "required": ["result", "notes"], "properties": {"result": {"type": "string", "enum": ["PASS", "REJECT"]}, "notes": {"type": "string"}}},
+        "scope_discipline": {"type": "object", "required": ["result", "notes"], "properties": {"result": {"type": "string", "enum": ["PASS", "REJECT"]}, "notes": {"type": "string"}}},
+        "forensic_integrity": {"type": "object", "required": ["result", "notes"], "properties": {"result": {"type": "string", "enum": ["PASS", "REJECT"]}, "notes": {"type": "string"}}}
+      }
+    },
+    "rejection_reasons": {"type": "array", "items": {"type": "string"}},
+    "known_gaps": {"type": "array", "items": {"type": "string"}}
+  }
+}
