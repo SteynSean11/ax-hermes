@@ -126,12 +126,73 @@ this is a pure addition and an upstream sync stays clean.
 
 ## What still needs an owner
 
-- **Secret `CLAUDE_CODE_OAUTH_TOKEN`** on `SteynSean11/ax-hermes`. Without
-  it the MAR workflow records `error` (never `success`): "MAR not run:
-  CLAUDE_CODE_OAUTH_TOKEN is not set".
-- **Branch protection on `beta`** once the workflows above are merged.
-  Required checks: `MAR` plus the `CI` and `Security` checks,
-  `enforce_admins: true`, 0 required reviews — matching `ax-trax`.
+- **Secret `CLAUDE_CODE_OAUTH_TOKEN`** on `SteynSean11/ax-hermes` — **set
+  by the owner on 2026-10-30.** Without it the MAR workflow records
+  `error` (never `success`): "MAR not run: CLAUDE_CODE_OAUTH_TOKEN is not
+  set".
+
+## Branch protection
+
+`beta` is protected (applied 2026-10-30, after the baseline PR merged).
+
+| Setting | Value |
+|---|---|
+| required checks | `MAR`, `Gitleaks current-tree scan`, `Semgrep static analysis` |
+| `enforce_admins` | `true` |
+| required approving reviews | 0 |
+| force pushes / deletions | blocked |
+
+**Why `Security` but not `CI`.** This fork inherits upstream's CI
+orchestrator, which has pre-existing failures unrelated to the ApexSigma
+baseline:
+
+- `tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload`
+  — verified failing on the base commit with the C4 port's changes
+  stashed, so it is upstream's, not the port's
+- a Playwright Desktop E2E timeout (`background dot should appear`)
+
+Requiring `CI` would deadlock every PR. The two surfaces this fork owns —
+the committed-secret scan and the static analysis — are the `Security`
+workflow's jobs, and both are green.
+
+When this branch is re-based onto upstream `main` (which restores the
+packages the current test suite imports), add the `CI` requirement back.
+
+## Known gap: the contributor attribution check enumerates the whole history
+
+Upstream's `contributor-check.yml` computes its merge base against
+`origin/main`:
+
+```sh
+MERGE_BASE=$(git merge-base origin/main HEAD)
+NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+```
+
+On this fork `beta` and `main` have **unrelated histories** — `beta` is a
+2-commit orphan (a squashed upstream snapshot `b4f8c491d` plus one
+ApexSigma commit `61ff50abd`), while `main` is upstream's own line. There
+is no merge base, so `MERGE_BASE` is empty and `git log ..HEAD` resolves
+to `git log HEAD`: **every author reachable from HEAD**, not just the
+PR's new commits.
+
+That set is three emails, and two are handled by upstream's own rules:
+
+| Email | Handling |
+|---|---|
+| `307254004+hermes-seaeye[bot]@users.noreply.github.com` | skipped (bot) |
+| `steynsean11@gmail.com` | mapped via `contributors/emails/` |
+| `sean.steyn@caffe.co.za` | mapped via `contributors/emails/` |
+
+Both mappings were added with upstream's own tool,
+`scripts/add_contributor.py`. The upstream check is **not** modified —
+its `origin/main` merge base is correct for upstream, where `main` is
+the default branch; it is this fork's unrelated-history layout that
+widens the email set, and the mapping is the fix upstream's workflow
+prescribes for an unmapped email.
+
+The check only runs on PRs that touch `.github/` (the change classifier
+treats any `.github/` change as CI-sensitive), so it was skipped on every
+PR before the branch-protection notes were added.
 
 ## Integration branch
 
