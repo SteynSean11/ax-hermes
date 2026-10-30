@@ -1,0 +1,489 @@
+name: MAR
+
+# Mandatory Agent Review (MAR) gate, eco-context SPEC-MAR-003 (active, ratified 2026-09-28).
+# Replaces the always-on claude-code-review.yml: AI review runs only when a
+# human asks for it (label `mar-review`, a `/mar` comment, or a manual run),
+# and only after CI + Security are green on the PR head. The result is one
+# commit status, `MAR`, on the head SHA. A new push invalidates it.
+# See docs/ci-cd.md "MAR review" for the operator guide.
+#
+# Trust model (SPEC-CICD-001 §11.10): pull_request_target / issue_comment run
+# this file, the prompt and scripts/mar_gate.py from the BASE branch. PR code
+# is checked out as data only and is never executed; the reviewer gets
+# read-only tools.
+
+on:
+  pull_request_target:
+    # edited: only a base change matters (a stacked PR retargeted); other
+    # edits are filtered out by the route job's `if`.
+    types: [opened, reopened, ready_for_review, synchronize, labeled, edited]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to review"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  MAR_LABEL: mar-review
+  # MAR reviews only PRs into this branch. A stacked PR (base = another PR's
+  # branch) gets no CI/Security evidence, because those workflows run only on
+  # PRs into beta, so its MAR is deferred until it is restacked onto beta.
+  MAR_BASE: ${{ vars.MAR_BASE_BRANCH || 'beta' }}
+
+jobs:
+  route:
+    name: Route MAR event
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+        (github.event.action != 'edited' || github.event.changes.base)) ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/mar'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write # remove the MAR label on a new push
+      issues: write
+      statuses: write
+    outputs:
+      mode: ${{ steps.route.outputs.mode }}
+      pr: ${{ steps.route.outputs.pr }}
+      head_sha: ${{ steps.route.outputs.head_sha }}
+    steps:
+      - name: Decide what this event means for MAR
+        id: route
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+          ASSOC: ${{ github.event.comment.author_association }}
+          BODY: ${{ github.event.comment.body }}
+          AUTO_RERUN: ${{ vars.MAR_AUTO_RERUN || 'false' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          pr="${PR_NUMBER}"
+          pr_json="$(gh api "repos/${REPO}/pulls/${pr}")"
+          head_sha="$(jq -r .head.sha <<<"${pr_json}")"
+          base_ref="$(jq -r .base.ref <<<"${pr_json}")"
+          labels="$(gh api "repos/${REPO}/issues/${pr}/labels" --jq '.[].name')"
+          has_label=false
+          if grep -qx "${MAR_LABEL}" <<<"${labels}"; then has_label=true; fi
+
+          mode=none
+          case "${EVENT}/${ACTION}" in
+            pull_request_target/synchronize)
+              if [ "${AUTO_RERUN}" = "true" ] && [ "${has_label}" = "true" ]; then
+                mode=review
+              else
+                mode=invalidate
+              fi ;;
+            pull_request_target/opened|pull_request_target/reopened|pull_request_target/ready_for_review)
+              mode=request ;;
+            pull_request_target/labeled)
+              if [ "${LABEL}" = "${MAR_LABEL}" ]; then mode=review; fi ;;
+            pull_request_target/edited)
+              # Base changed (the route job's `if` drops other edits).
+              mode=retarget ;;
+            workflow_dispatch/*)
+              mode=review ;;
+            issue_comment/*)
+              case "${ASSOC}" in
+                OWNER|MEMBER|COLLABORATOR)
+                  first_line="$(printf '%s\n' "${BODY}" | head -n1 | tr -d '\r')"
+                  case "${first_line}" in
+                    "/mar override:"*) mode=override ;;
+                    "/mar"|"/mar review") mode=review ;;
+                  esac ;;
+                *) echo "::notice title=MAR::ignored /mar from author_association=${ASSOC}" ;;
+              esac ;;
+          esac
+
+          # Stacked PR: no CI/Security evidence exists (those run only on
+          # PRs into MAR_BASE), so a review could only fail. Defer it instead
+          # of spending quota or recording a misleading failure.
+          if [ "${base_ref}" != "${MAR_BASE}" ]; then
+            case "${mode}" in
+              review|request|retarget) mode=deferred ;;
+            esac
+          fi
+
+          set_status() {
+            local description="$2"
+            # GitHub rejects a status description over 140 characters.
+            gh api "repos/${REPO}/statuses/${head_sha}" \
+              -f state="$1" -f context=MAR -f description="${description:0:140}" \
+              -f target_url="${RUN_URL}" >/dev/null
+          }
+          drop_label() {
+            if [ "${has_label}" = "true" ]; then
+              gh api -X DELETE "repos/${REPO}/issues/${pr}/labels/${MAR_LABEL}" >/dev/null || true
+            fi
+          }
+          case "${mode}" in
+            invalidate)
+              # SPEC-MAR-003 §7: a verdict belongs to one SHA. The new head
+              # has no verdict; drop the label so re-review is an explicit ask.
+              set_status pending "MAR required: new push. Add label ${MAR_LABEL} or comment /mar"
+              drop_label ;;
+            deferred)
+              # The label is dropped so re-adding it after the restack fires.
+              set_status pending "MAR deferred: stacked on ${base_ref}. Restack onto ${MAR_BASE}, then /mar"
+              drop_label ;;
+            retarget)
+              # Same SHA, new base. pull_request CI does not re-run on a base
+              # change, and after a squash merge the old stack commits are
+              # still in the diff, so ask for a restack push (which runs CI
+              # and moves the head) before review.
+              set_status pending "MAR required: retargeted to ${MAR_BASE}. Restack/push so CI runs, then /mar"
+              drop_label ;;
+            request)
+              current="$(gh api "repos/${REPO}/commits/${head_sha}/status" \
+                --jq '[.statuses[] | select(.context == "MAR")] | length')"
+              if [ "${current}" = "0" ]; then
+                set_status pending "MAR required: add label ${MAR_LABEL} or comment /mar"
+              fi ;;
+          esac
+
+          {
+            echo "mode=${mode}"
+            echo "pr=${pr}"
+            echo "head_sha=${head_sha}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "MAR route: event=${EVENT}/${ACTION} pr=#${pr} base=${base_ref} head=${head_sha} mode=${mode}" >> "${GITHUB_STEP_SUMMARY}"
+
+  review:
+    name: MAR review
+    needs: route
+    if: needs.route.outputs.mode == 'review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: mar-review-${{ needs.route.outputs.pr }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      actions: read # list workflow runs on the head SHA (evidence)
+      pull-requests: write # verdict comment
+      issues: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ needs.route.outputs.pr }}
+      HEAD_SHA: ${{ needs.route.outputs.head_sha }}
+      REQUIRED_WORKFLOWS: ${{ vars.MAR_REQUIRED_WORKFLOWS || 'CI,Security' }}
+      SECOND_REVIEWER: ${{ vars.MAR_SECOND_REVIEWER || 'none' }}
+      # anthropic-compat only: the model ID doubles as the reviewer's name;
+      # `advisory` (default) reports its verdict without counting it.
+      SECOND_MODEL: ${{ vars.MAR_SECOND_MODEL }}
+      SECOND_MODE: ${{ vars.MAR_SECOND_MODE || 'advisory' }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      MAR_GATE: .mar-base/scripts/mar_gate.py
+    steps:
+      - name: Checkout PR head (data only, never executed)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.route.outputs.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout trusted base (prompt, schema, mar_gate.py)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: .mar-base
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            .github/mar
+            scripts/mar_gate.py
+          sparse-checkout-cone-mode: false
+
+      - name: Mark MAR running
+        run: |
+          gh api "repos/${REPO}/statuses/${HEAD_SHA}" -f state=pending -f context=MAR \
+            -f description="MAR review running" -f target_url="${RUN_URL}" >/dev/null
+
+      - name: Collect track context and CI evidence
+        id: ctx
+        run: |
+          set -euo pipefail
+          # Project instructions in the PR must not steer the reviewer; their
+          # changes stay visible in .mar/pr.diff.
+          find . -path ./.git -prune -o -path ./.mar-base -prune -o \
+            \( -name CLAUDE.md -o -name GEMINI.md -o -name .claude -o -name .gemini \) -print0 \
+            | xargs -0 -r rm -rf
+          rm -rf .mar && mkdir .mar
+
+          gh api "repos/${REPO}/pulls/${PR}" > "${RUNNER_TEMP}/pr.json"
+          jq -r '.body // ""' "${RUNNER_TEMP}/pr.json" > "${RUNNER_TEMP}/body.md"
+          branch="$(jq -r .head.ref "${RUNNER_TEMP}/pr.json")"
+          title="$(jq -r '.title // ""' "${RUNNER_TEMP}/pr.json")"
+          gh api "repos/${REPO}/pulls/${PR}" -H "Accept: application/vnd.github.diff" > .mar/pr.diff
+          gh api "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" > "${RUNNER_TEMP}/runs.json"
+
+          python3 "${MAR_GATE}" --github-output "${GITHUB_OUTPUT}" detect-track \
+            --branch "${branch}" --title "${title}" --body-file "${RUNNER_TEMP}/body.md" --trax-root trax
+          python3 "${MAR_GATE}" --github-output "${GITHUB_OUTPUT}" evidence \
+            --runs-file "${RUNNER_TEMP}/runs.json" --required "${REQUIRED_WORKFLOWS}" \
+            --head-sha "${HEAD_SHA}" --table-file .mar/evidence.md
+
+      - name: Write reviewer context
+        env:
+          TRACK_ID: ${{ steps.ctx.outputs.track_id }}
+          TRACK_SOURCE: ${{ steps.ctx.outputs.track_source }}
+          TRACK_FILES: ${{ steps.ctx.outputs.track_files }}
+        run: |
+          set -euo pipefail
+          {
+            echo "# MAR context"
+            echo
+            echo "- Repository: ${REPO}"
+            echo "- PR: #${PR} ($(jq -r .html_url "${RUNNER_TEMP}/pr.json"))"
+            echo "- Title: $(jq -r .title "${RUNNER_TEMP}/pr.json")"
+            echo "- Branch: $(jq -r .head.ref "${RUNNER_TEMP}/pr.json") -> $(jq -r .base.ref "${RUNNER_TEMP}/pr.json")"
+            echo "- Head SHA under review: ${HEAD_SHA}"
+            echo "- Track: ${TRACK_ID:-none} (detected from: ${TRACK_SOURCE})"
+            echo
+            echo "## Track files"
+            echo
+            if [ -n "${TRACK_FILES}" ]; then
+              for f in ${TRACK_FILES}; do echo "- ${f}"; done
+            else
+              echo "_No track directory matched the branch or PR body._"
+            fi
+            echo
+            echo "## Change summary, verification notes and known gaps (PR body, author-written)"
+            echo
+            cat "${RUNNER_TEMP}/body.md"
+          } > .mar/context.md
+
+      - name: Stop when evidence is not green
+        if: steps.ctx.outputs.ready != 'true'
+        env:
+          SUMMARY: ${{ steps.ctx.outputs.summary }}
+        run: |
+          gh api "repos/${REPO}/statuses/${HEAD_SHA}" -f state=failure -f context=MAR \
+            -f description="${SUMMARY}" -f target_url="${RUN_URL}" >/dev/null
+          echo "::notice title=MAR not run::${SUMMARY}. No AI quota spent; re-request once CI and Security are green."
+
+      - name: Check reviewer credentials
+        id: creds
+        if: steps.ctx.outputs.ready == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SECOND_API_KEY: ${{ secrets.MAR_SECOND_API_KEY }}
+          SECOND_BASE_URL: ${{ vars.MAR_SECOND_BASE_URL }}
+        run: |
+          # Skipped is not passed (SPEC-CICD-001 §3.2): a missing credential
+          # makes MAR `error`, never `success`.
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ]; then
+            gh api "repos/${REPO}/statuses/${HEAD_SHA}" -f state=error -f context=MAR \
+              -f description="MAR not run: CLAUDE_CODE_OAUTH_TOKEN is not set" -f target_url="${RUN_URL}" >/dev/null
+            echo "::notice title=MAR not run::CLAUDE_CODE_OAUTH_TOKEN is not set for this repository."
+            echo "primary=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "primary=true" >> "${GITHUB_OUTPUT}"
+          fi
+          if [ "${SECOND_REVIEWER}" = "gemini" ] && [ -z "${GEMINI_API_KEY}" ]; then
+            echo "::warning title=MAR second reviewer::MAR_SECOND_REVIEWER=gemini but GEMINI_API_KEY is not set; MAR will be incomplete."
+          fi
+          if [ "${SECOND_REVIEWER}" = "anthropic-compat" ] && \
+            { [ -z "${SECOND_API_KEY}" ] || [ -z "${SECOND_BASE_URL}" ] || [ -z "${SECOND_MODEL}" ]; }; then
+            echo "::warning title=MAR second reviewer::MAR_SECOND_REVIEWER=anthropic-compat needs secret MAR_SECOND_API_KEY and variables MAR_SECOND_BASE_URL and MAR_SECOND_MODEL; its verdict will be missing."
+          fi
+
+      - name: Load prompt contract and verdict schema
+        id: contract
+        if: steps.creds.outputs.primary == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "prompt<<MAR_PROMPT_EOF"
+            cat .mar-base/.github/mar/prompt.md
+            echo
+            echo "Ignore the .mar-base/ directory: it is the review tooling, not the change."
+            echo "MAR_PROMPT_EOF"
+            echo "schema=$(jq -c . .mar-base/.github/mar/verdict.schema.json)"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Primary reviewer (Claude)
+        id: claude
+        if: steps.creds.outputs.primary == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.contract.outputs.prompt }}
+          claude_args: >-
+            --max-turns 40
+            --allowedTools Read,Glob,Grep
+            --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch
+            --json-schema '${{ steps.contract.outputs.schema }}'
+
+      - name: Second reviewer (Gemini, behind MAR_SECOND_REVIEWER=gemini)
+        id: gemini
+        if: steps.creds.outputs.primary == 'true' && env.SECOND_REVIEWER == 'gemini'
+        continue-on-error: true
+        uses: google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489 # v0.1.22
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          prompt: |
+            ${{ steps.contract.outputs.prompt }}
+
+            Finish your answer with exactly one fenced ```json block that
+            validates against this JSON schema, and nothing after it:
+            ${{ steps.contract.outputs.schema }}
+
+      - name: Second reviewer (Anthropic-compatible API, behind MAR_SECOND_REVIEWER=anthropic-compat)
+        if: steps.creds.outputs.primary == 'true' && env.SECOND_REVIEWER == 'anthropic-compat'
+        continue-on-error: true
+        timeout-minutes: 16
+        env:
+          SECOND_API_KEY: ${{ secrets.MAR_SECOND_API_KEY }}
+          SECOND_BASE_URL: ${{ vars.MAR_SECOND_BASE_URL }}
+          TRACK_FILES: ${{ steps.ctx.outputs.track_files }}
+        run: |
+          set -euo pipefail
+          # One tool-less Messages API call (e.g. MiniMax). The model sees the
+          # same inputs as Claude, inlined; its reply goes through parse-text,
+          # so a failure here is a missing verdict, never a PASS.
+          case "${SECOND_BASE_URL}" in
+            https://*) ;;
+            *) echo "::warning title=MAR second reviewer::MAR_SECOND_BASE_URL must start with https://"; exit 1 ;;
+          esac
+          base="${SECOND_BASE_URL%/}"
+          case "${base}" in */v1) url="${base}/messages" ;; *) url="${base}/v1/messages" ;; esac
+          inputs=(--input .mar/context.md --input .mar/evidence.md --input .mar/pr.diff)
+          for f in ${TRACK_FILES}; do inputs+=(--input "${f}"); done
+          python3 "${MAR_GATE}" compat-request --model "${SECOND_MODEL}" \
+            --prompt-file .mar-base/.github/mar/prompt.md \
+            --schema-file .mar-base/.github/mar/verdict.schema.json \
+            "${inputs[@]}" --out "${RUNNER_TEMP}/compat-request.json"
+          # The key goes in a header file, never on a command line.
+          (umask 077; printf 'x-api-key: %s\nAuthorization: Bearer %s\n' \
+            "${SECOND_API_KEY}" "${SECOND_API_KEY}" > "${RUNNER_TEMP}/compat-headers")
+          code="$(curl -sS --max-time 900 -o "${RUNNER_TEMP}/compat-response.json" -w '%{http_code}' \
+            -H @"${RUNNER_TEMP}/compat-headers" -H 'anthropic-version: 2023-06-01' \
+            -H 'content-type: application/json' \
+            --data-binary @"${RUNNER_TEMP}/compat-request.json" "${url}")" || code=000
+          rm -f "${RUNNER_TEMP}/compat-headers"
+          if [ "${code}" != "200" ]; then
+            detail="$(jq -r '.error.message // .base_resp.status_msg // empty' \
+              "${RUNNER_TEMP}/compat-response.json" 2>/dev/null | head -c 300 || true)"
+            echo "::warning title=MAR second reviewer::HTTP ${code} from ${SECOND_MODEL}: ${detail:-no error detail}"
+          fi
+
+      - name: Aggregate verdicts into the MAR status
+        if: steps.creds.outputs.primary == 'true'
+        env:
+          CLAUDE_VERDICT: ${{ steps.claude.outputs.structured_output }}
+          GEMINI_TEXT: ${{ steps.gemini.outputs.summary }}
+          TRACK_ID: ${{ steps.ctx.outputs.track_id }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${CLAUDE_VERDICT}" > "${RUNNER_TEMP}/verdict-claude.json"
+          args=(--verdict "claude=${RUNNER_TEMP}/verdict-claude.json")
+          if [ "${SECOND_REVIEWER}" = "gemini" ]; then
+            printf '%s' "${GEMINI_TEXT}" > "${RUNNER_TEMP}/gemini.txt"
+            python3 "${MAR_GATE}" parse-text --text-file "${RUNNER_TEMP}/gemini.txt" \
+              --out "${RUNNER_TEMP}/verdict-gemini.json"
+            args+=(--verdict "gemini=${RUNNER_TEMP}/verdict-gemini.json" --second-required)
+          elif [ "${SECOND_REVIEWER}" = "anthropic-compat" ]; then
+            python3 "${MAR_GATE}" compat-text --response-file "${RUNNER_TEMP}/compat-response.json" \
+              --out "${RUNNER_TEMP}/compat.txt"
+            python3 "${MAR_GATE}" parse-text --text-file "${RUNNER_TEMP}/compat.txt" \
+              --out "${RUNNER_TEMP}/verdict-compat.json"
+            name="${SECOND_MODEL:-anthropic-compat}"
+            if [ "${SECOND_MODE}" = "required" ]; then
+              args+=(--verdict "${name}=${RUNNER_TEMP}/verdict-compat.json" --second-required)
+            else
+              args+=(--advisory "${name}=${RUNNER_TEMP}/verdict-compat.json")
+            fi
+          fi
+          python3 "${MAR_GATE}" --github-output "${RUNNER_TEMP}/agg.env" aggregate "${args[@]}" \
+            --head-sha "${HEAD_SHA}" --track "${TRACK_ID}" \
+            --evidence-file .mar/evidence.md --report "${RUNNER_TEMP}/report.md"
+          state="$(sed -n 's/^state=//p' "${RUNNER_TEMP}/agg.env")"
+          description="$(sed -n 's/^description=//p' "${RUNNER_TEMP}/agg.env")"
+
+          gh api "repos/${REPO}/statuses/${HEAD_SHA}" -f state="${state}" -f context=MAR \
+            -f description="${description}" -f target_url="${RUN_URL}" >/dev/null
+
+          existing="$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+            --jq '.[] | select(.body | startswith("<!-- mar-review -->")) | .id' | tail -n1)"
+          if [ -n "${existing}" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@"${RUNNER_TEMP}/report.md" >/dev/null
+          else
+            gh api "repos/${REPO}/issues/${PR}/comments" -F body=@"${RUNNER_TEMP}/report.md" >/dev/null
+          fi
+          cat "${RUNNER_TEMP}/report.md" >> "${GITHUB_STEP_SUMMARY}"
+          echo "MAR: ${state} (${description})"
+
+  override:
+    name: MAR override (SPEC-MAR-002)
+    needs: route
+    if: needs.route.outputs.mode == 'override'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ needs.route.outputs.pr }}
+      HEAD_SHA: ${{ needs.route.outputs.head_sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Checkout trusted base
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: scripts/mar_gate.py
+          sparse-checkout-cone-mode: false
+
+      - name: Validate and record the override
+        env:
+          BODY: ${{ github.event.comment.body }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          APPROVERS: ${{ vars.MAR_OVERRIDE_APPROVERS || 'SteynSean11' }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${BODY}" > "${RUNNER_TEMP}/body.md"
+          python3 scripts/mar_gate.py --github-output "${RUNNER_TEMP}/ovr.env" override \
+            --body-file "${RUNNER_TEMP}/body.md" --actor "${ACTOR}" --approvers "${APPROVERS}"
+          accepted="$(sed -n 's/^accepted=//p' "${RUNNER_TEMP}/ovr.env")"
+          detail="$(sed -n 's/^detail=//p' "${RUNNER_TEMP}/ovr.env")"
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [ "${accepted}" = "true" ]; then
+            gh api "repos/${REPO}/statuses/${HEAD_SHA}" -f state=success -f context=MAR \
+              -f description="MAR OVERRIDE by @${ACTOR} (SPEC-MAR-002); see PR comment" \
+              -f target_url="${COMMENT_URL}" >/dev/null
+            printf '%s\n' "<!-- mar-override -->" \
+              "## MAR override recorded" "" \
+              "- Approver: @${ACTOR}" "- Head SHA: \`${HEAD_SHA}\`" "- Recorded: ${now}" \
+              "- Request: ${COMMENT_URL}" "- Reason: ${detail}" "" \
+              "Override is an exception, not workflow (SPEC-MAR-001). It covers this SHA only; a new push invalidates it." \
+              > "${RUNNER_TEMP}/audit.md"
+          else
+            printf '%s\n' "<!-- mar-override -->" "MAR override **rejected** (${now}): ${detail}" > "${RUNNER_TEMP}/audit.md"
+          fi
+          gh api "repos/${REPO}/issues/${PR}/comments" -F body=@"${RUNNER_TEMP}/audit.md" >/dev/null
+          echo "MAR override accepted=${accepted}: ${detail}" >> "${GITHUB_STEP_SUMMARY}"
