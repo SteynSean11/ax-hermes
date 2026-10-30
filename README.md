@@ -247,6 +247,24 @@ scripts/run_tests.sh
 
 ---
 
+## This fork
+
+`SteynSean11/ax-hermes` is an ApexSigma fork of
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).
+The integration branch is **`beta`**; upstream's `main` is left running
+untouched.
+
+The fork carries the shared ApexSigma CI baseline — a committed-secret
+scan (Gitleaks) and Semgrep static analysis — alongside the Mandatory
+Agent Review (MAR) gate. Pull requests into `beta` are MAR-reviewed; ask
+for a review with a `/mar` comment.
+
+Fork-specific notes — what was changed relative to upstream, and why —
+are in
+[`.github/workflows/README-fork-notes.md`](.github/workflows/README-fork-notes.md).
+
+---
+
 ## Community
 
 - 💬 [Discord](https://discord.gg/NousResearch)
