@@ -126,12 +126,37 @@ this is a pure addition and an upstream sync stays clean.
 
 ## What still needs an owner
 
-- **Secret `CLAUDE_CODE_OAUTH_TOKEN`** on `SteynSean11/ax-hermes`. Without
-  it the MAR workflow records `error` (never `success`): "MAR not run:
-  CLAUDE_CODE_OAUTH_TOKEN is not set".
-- **Branch protection on `beta`** once the workflows above are merged.
-  Required checks: `MAR` plus the `CI` and `Security` checks,
-  `enforce_admins: true`, 0 required reviews — matching `ax-trax`.
+- **Secret `CLAUDE_CODE_OAUTH_TOKEN`** on `SteynSean11/ax-hermes` — **set
+  by the owner on 2026-10-30.** Without it the MAR workflow records
+  `error` (never `success`): "MAR not run: CLAUDE_CODE_OAUTH_TOKEN is not
+  set".
+
+## Branch protection
+
+`beta` is protected (applied 2026-10-30, after the baseline PR merged).
+
+| Setting | Value |
+|---|---|
+| required checks | `MAR`, `Gitleaks current-tree scan`, `Semgrep static analysis` |
+| `enforce_admins` | `true` |
+| required approving reviews | 0 |
+| force pushes / deletions | blocked |
+
+**Why `Security` but not `CI`.** This fork inherits upstream's CI
+orchestrator, which has pre-existing failures unrelated to the ApexSigma
+baseline:
+
+- `tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload`
+  — verified failing on the base commit with the C4 port's changes
+  stashed, so it is upstream's, not the port's
+- a Playwright Desktop E2E timeout (`background dot should appear`)
+
+Requiring `CI` would deadlock every PR. The two surfaces this fork owns —
+the committed-secret scan and the static analysis — are the `Security`
+workflow's jobs, and both are green.
+
+When this branch is re-based onto upstream `main` (which restores the
+packages the current test suite imports), add the `CI` requirement back.
 
 ## Integration branch
 
