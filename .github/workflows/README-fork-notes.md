@@ -158,6 +158,42 @@ workflow's jobs, and both are green.
 When this branch is re-based onto upstream `main` (which restores the
 packages the current test suite imports), add the `CI` requirement back.
 
+## Known gap: the contributor attribution check enumerates the whole history
+
+Upstream's `contributor-check.yml` computes its merge base against
+`origin/main`:
+
+```sh
+MERGE_BASE=$(git merge-base origin/main HEAD)
+NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+```
+
+On this fork `beta` and `main` have **unrelated histories** — `beta` is a
+2-commit orphan (a squashed upstream snapshot `b4f8c491d` plus one
+ApexSigma commit `61ff50abd`), while `main` is upstream's own line. There
+is no merge base, so `MERGE_BASE` is empty and `git log ..HEAD` resolves
+to `git log HEAD`: **every author reachable from HEAD**, not just the
+PR's new commits.
+
+That set is three emails, and two are handled by upstream's own rules:
+
+| Email | Handling |
+|---|---|
+| `307254004+hermes-seaeye[bot]@users.noreply.github.com` | skipped (bot) |
+| `steynsean11@gmail.com` | mapped via `contributors/emails/` |
+| `sean.steyn@caffe.co.za` | mapped via `contributors/emails/` |
+
+Both mappings were added with upstream's own tool,
+`scripts/add_contributor.py`. The upstream check is **not** modified —
+its `origin/main` merge base is correct for upstream, where `main` is
+the default branch; it is this fork's unrelated-history layout that
+widens the email set, and the mapping is the fix upstream's workflow
+prescribes for an unmapped email.
+
+The check only runs on PRs that touch `.github/` (the change classifier
+treats any `.github/` change as CI-sensitive), so it was skipped on every
+PR before the branch-protection notes were added.
+
 ## Integration branch
 
 `beta` is the integration branch. Upstream's default branch is `main`;
