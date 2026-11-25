@@ -199,3 +199,69 @@ PR before the branch-protection notes were added.
 `beta` is the integration branch. Upstream's default branch is `main`;
 `beta` matches the other four ApexSigma repositories and is where the
 ApexSigma-side work lands. Upstream's `main` workflows are left untouched.
+
+## Disabled upstream workflows
+
+**Context:** `RUNBOOK-INFRA-700-001`, gate GC, step C4. Upstream workflows
+that need secrets this fork lacks, or that enforce NousResearch process,
+are **disabled, not deleted**: each one is renamed with `git mv` to
+`<name>.yml.disabled`, and its content is unchanged. GitHub Actions loads
+only `*.yml` and `*.yaml` from `.github/workflows/`, so a `.disabled` file
+is inert. An upstream sync shows a clean rename and keeps the original
+content available.
+
+Evidence was collected on 2026-11-25:
+
+- **Repo secrets (names only):** `CLAUDE_CODE_OAUTH_TOKEN`.
+- **Repo variables:** `MAR_REQUIRED_WORKFLOWS`.
+- **Branches:** `beta` only. There is no `main` branch on this fork.
+- **Recent runs:** `gh run list --workflow <file> -L 5`. Sub-workflows
+  that are called through `ci.yml` (`workflow_call`) have no runs of their
+  own, so their evidence comes from the jobs inside the `CI` runs on
+  PR #4 and PR #5.
+
+| File | Classification | Reason | Re-enable |
+|---|---|---|---|
+| `contributor-check.yml` | disable-upstream-only | Enforces upstream contributor attribution against `origin/main`. The fork has no `main`, so on PR #5 the job fails with `fatal: Not a valid object name origin/main` (exit 128). This supersedes the "Known gap" section above. | `git mv` it back to `.yml`. Restore the `contributor-check` job in `ci.yml` and its entries in the `comment-live` and `all-checks-pass` `needs:`. Point `origin/main` at `origin/beta` first |
+| `history-check.yml` | disable-upstream-only | Requires a common ancestor with upstream `origin/main`. `beta` is an orphan history and `main` does not exist, so it fails on every PR ("This PR has no common ancestor with main") | Same as above, for the `history-check` job. Only useful after a rebase onto upstream `main` |
+| `review-labels.yml` | disable-upstream-only | Upstream maintainer gate: any CI-sensitive change needs the `ci-reviewed` label. It failed on PR #5. On this fork, MAR is the review gate | `git mv` it back. Restore the `review-labels` job in `ci.yml` and its `needs:` entries in `comment-live` and `all-checks-pass` |
+| `label-rerun.yml` | disable-upstream-only | Companion to `review-labels.yml`: it reruns CI when `ci-reviewed` is added. It has no purpose without that gate | `git mv` it back together with `review-labels.yml` |
+| `deploy-site.yml` | disable-needs-secret | Deploys upstream's docs site through Vercel. It needs `VERCEL_DEPLOY_HOOK`, `APP_PRIVATE_KEY` and `vars.APP_CLIENT_ID`, which are all absent, and its jobs are guarded to `NousResearch/hermes-agent`. It triggers on `main` pushes and releases, and has no runs here | Add the secrets and the variable, drop the repo guard, then `git mv` it back |
+| `docker.yml` | disable-needs-secret | Builds and publishes `nousresearch/hermes-agent` to Docker Hub. It needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, and every job is guarded to `NousResearch/hermes-agent`, so all three jobs were `skipped` on PR #4 and PR #5. The `docker` job is removed from `ci.yml`. `tests/docker/` only ran from this workflow, so it never ran on this fork | Set `IMAGE_NAME`, add the secrets, drop the repo guard, `git mv` it back, then restore the `docker` job in `ci.yml` and `ci-timings` `needs:` |
+| `js-autofix.yml` | disable-needs-secret | Pushes eslint autofix PRs from `main` with a GitHub App token. It needs `APP_PRIVATE_KEY` and `vars.APP_CLIENT_ID`, and triggers on `main` only. It has no runs here | Add the App credentials, retarget to `beta`, then `git mv` it back |
+| `publish-e2e-evidence.yml` | disable-needs-secret | Runs after every `CI` completion. It needs `GH_IMAGE_SESSION_TOKEN` in the `gh-image` environment. **It failed on all 5 recent runs** with `GH_SESSION_TOKEN is required` | Add the `gh-image` environment and the secret, then `git mv` it back |
+| `skills-index.yml` | disable-needs-secret | Builds upstream's skills index, which feeds `deploy-site.yml`. It needs `APP_PRIVATE_KEY` and `vars.APP_CLIENT_ID`, and is guarded to `NousResearch/hermes-agent`. It ran twice a day as a `skipped` no-op (5 of 5 recent runs) | Re-enable together with `deploy-site.yml` |
+| `skills-index-freshness.yml` | disable-needs-secret | Probes upstream's live `hermes-agent.nousresearch.com` index and opens issues. It uses the `trusted-automation` environment, is guarded to `NousResearch/hermes-agent`, and ran every 4 hours as a `skipped` no-op (5 of 5 recent runs) | Re-enable together with `skills-index.yml` |
+
+Kept (not renamed):
+
+| File | Classification | Evidence |
+|---|---|---|
+| `ci.yml` | keep-but-fix | The orchestrator. The only edit removes the `uses:` calls and `needs:` entries for the disabled sub-workflows. A dangling `uses: ./.github/workflows/<x>.yml` would make the entire `CI` workflow fail to load |
+| `mar-review.yml`, `mar-audit.yml` | keep | They produce the required `MAR` check and the post-merge audit. Recent runs are `success` |
+| `security.yml` | keep | It produces the required `Gitleaks current-tree scan` and `Semgrep static analysis` checks. Recent runs are `success` |
+| `osv-scanner.yml` | keep | The weekly schedule and the `CI` job are both `success` |
+| `tests.yml` | keep | Slices 1–6 and 8 plus `e2e` pass. Slice 7/8 has a known failure that comes from the runner image; see below |
+| `lint.yml`, `js-tests.yml`, `e2e-desktop.yml`, `docs-site-checks.yml`, `uv-lockfile-check.yml`, `infographic-check.yml`, `lockfile-diff.yml`, `docker-lint.yml`, `supply-chain-audit.yml` | keep | All were `success` in `CI` on PR #5. They need no secrets and run the fork's own code |
+
+### Known failure: `Python tests / Run tests slice 7/8`
+
+`tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload[sort-args2-{bulk}-False]`
+fails on every CI run since 2026-10-30 (PR #3 run 41000632328, PR #4 run 44127212733, PR #5 runs 45622144371 and 45629157508). The cause is
+the runner image, not a fork regression:
+
+- GitHub's `ubuntu-latest` now uses **Ubuntu 26.04**, where `/usr/bin/sort`
+  is **uutils (rust-coreutils)**, not GNU coreutils.
+- uutils `sort` rejects a leading-dash value for `--compress-program`
+  (`error: unexpected argument '-p' found`, exit 2) and never runs the
+  program. GNU `sort` (`/usr/bin/gnusort` on 26.04) runs it. The test
+  asserts the GNU behaviour.
+- The detector under test, `tools.approval`, stays **conservative**: it
+  still flags `sort --compress-program -x`. Only the real-binary probe's
+  premise no longer holds on this image. This is an upstream test, so it
+  is documented here and not changed.
+
+Because `tests` feeds `All required checks pass`, that aggregate stays red
+until this is resolved upstream. It is not a required check: the required
+checks are `MAR`, `Gitleaks current-tree scan` and `Semgrep static analysis`,
+and `MAR_REQUIRED_WORKFLOWS=Security`.
