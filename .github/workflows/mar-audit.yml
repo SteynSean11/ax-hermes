@@ -78,30 +78,37 @@ jobs:
             fi
             shas=("${after}")
           fi
-          commits='[]'
+          # API responses go through files, never jq --argjson: a single argv
+          # string is capped at 128 KiB (MAX_ARG_STRLEN), and large status
+          # payloads failed with "Argument list too long" (exit 126).
+          work="${RUNNER_TEMP}/mar-audit"
+          mkdir -p "${work}"
+          echo '[]' > "${work}/commits.json"
           for sha in "${shas[@]}"; do
             # The commit -> PR association can lag a merge by a few seconds.
-            pulls='[]'
+            echo '[]' > "${work}/pulls.json"
             for attempt in 1 2 3; do
-              pulls="$(gh api "repos/${REPO}/commits/${sha}/pulls")"
-              if [[ "$(jq length <<<"${pulls}")" -gt 0 ]]; then break; fi
+              gh api "repos/${REPO}/commits/${sha}/pulls" > "${work}/pulls.json"
+              if [[ "$(jq length "${work}/pulls.json")" -gt 0 ]]; then break; fi
               if [[ "${attempt}" -lt 3 ]]; then sleep 10; fi
             done
-            commits="$(jq -c --arg sha "${sha}" --argjson pulls "${pulls}" \
-              '. + [{sha: $sha, pulls: $pulls}]' <<<"${commits}")"
+            jq -c --arg sha "${sha}" --slurpfile pulls "${work}/pulls.json" \
+              '. + [{sha: $sha, pulls: $pulls[0]}]' "${work}/commits.json" > "${work}/commits.next"
+            mv "${work}/commits.next" "${work}/commits.json"
           done
-          statuses='{}'
+          echo '{}' > "${work}/statuses.json"
           mapfile -t heads < <(jq -r --arg base "${BASE}" \
             '[.[].pulls[] | select(.merged_at != null and .base.ref == $base) | .head.sha] | unique | .[]' \
-            <<<"${commits}")
+            "${work}/commits.json")
           for head in "${heads[@]}"; do
-            status="$(gh api "repos/${REPO}/commits/${head}/status?per_page=100")"
-            statuses="$(jq -c --arg h "${head}" --argjson s "${status}" \
-              '. + {($h): $s}' <<<"${statuses}")"
+            gh api "repos/${REPO}/commits/${head}/status?per_page=100" > "${work}/status.json"
+            jq -c --arg h "${head}" --slurpfile s "${work}/status.json" \
+              '. + {($h): $s[0]}' "${work}/statuses.json" > "${work}/statuses.next"
+            mv "${work}/statuses.next" "${work}/statuses.json"
           done
           jq -n --arg repo "${REPO}" --arg base "${BASE}" --arg after "${after}" \
-            --argjson commits "${commits}" --argjson statuses "${statuses}" \
-            '{repo: $repo, base: $base, after: $after, commits: $commits, statuses: $statuses}' \
+            --slurpfile commits "${work}/commits.json" --slurpfile statuses "${work}/statuses.json" \
+            '{repo: $repo, base: $base, after: $after, commits: $commits[0], statuses: $statuses[0]}' \
             > "${RUNNER_TEMP}/audit-payload.json"
 
       - name: Evaluate
