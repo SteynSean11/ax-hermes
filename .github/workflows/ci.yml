@@ -13,6 +13,12 @@ name: CI
 # SECURITY: this workflow runs PR-controlled actions, workflows, and code.
 # Do not add ``secrets: inherit`` or GitHub App credentials here. Trusted
 # main-only automation uses protected environments in its own workflows.
+#
+# FORK (ax-hermes): the history-check, contributor-check, review-labels and
+# docker sub-workflows are disabled (``*.yml.disabled``) because they enforce
+# upstream NousResearch process or need secrets this fork lacks. Their jobs
+# are removed below. See .github/workflows/README-fork-notes.md
+# §"Disabled upstream workflows" for the table and how to re-enable each one.
 
 on:
   pull_request:
@@ -98,18 +104,6 @@ jobs:
     if: needs.detect.outputs.site == 'true'
     uses: ./.github/workflows/docs-site-checks.yml
 
-  history-check:
-    name: Deny unrelated histories
-    needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request'
-    uses: ./.github/workflows/history-check.yml
-
-  contributor-check:
-    name: Check contributors
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
-    uses: ./.github/workflows/contributor-check.yml
-
   uv-lockfile:
     name: Check uv.lock
     needs: detect
@@ -132,15 +126,6 @@ jobs:
     if: needs.detect.outputs.docker_meta == 'true'
     uses: ./.github/workflows/docker-lint.yml
 
-  docker:
-    name: Build&Test Docker image
-    needs: detect
-    # Trusted main pushes run docker.yml directly so its container-publish
-    # environment secrets never cross this reusable-workflow call. PR runs
-    # remain build/test-only and secret-free.
-    if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true' || needs.detect.outputs.docker_meta == 'true')
-    uses: ./.github/workflows/docker.yml
-
   supply-chain:
     name: Supply-chain scan
     needs: detect
@@ -150,17 +135,6 @@ jobs:
       event_name: ${{ needs.detect.outputs.event_name }}
       scan: ${{ needs.detect.outputs.scan == 'true' }}
       deps: ${{ needs.detect.outputs.deps == 'true' }}
-
-  review-labels:
-    name: Review label gate
-    needs: [detect, supply-chain]
-    if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
-    uses: ./.github/workflows/review-labels.yml
-    with:
-      ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
-      ci_review_files: ${{ needs.detect.outputs.ci_review_files }}
-      mcp_catalog: ${{ needs.detect.outputs.mcp_catalog == 'true' }}
-      supply_chain: ${{ needs.supply-chain.outputs.critical_findings == 'true' }}
 
   osv-scanner:
     name: OSV scan
@@ -179,7 +153,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   comment-live:
     name: CI review comment (live)
-    needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check, e2e-desktop]
+    needs: [detect, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, e2e-desktop]
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -262,17 +236,13 @@ jobs:
       - js-tests
       - e2e-desktop
       - docs-site
-      - history-check
-      - contributor-check
       - uv-lockfile
       - lockfile-diff
       - docker-lint
       - supply-chain
-      - review-labels
       - osv-scanner
       # comment-live is a polling job — it doesn't block the gate.
-      # we don't require docker to pass rn because it's so slow lol
-      # - docker
+      # docker (docker.yml) is disabled on this fork — see README-fork-notes.md.
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -314,7 +284,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   ci-timings:
     name: CI timing report
-    needs: [all-checks-pass, docker]
+    needs: [all-checks-pass]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
